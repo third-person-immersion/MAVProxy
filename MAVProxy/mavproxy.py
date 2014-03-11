@@ -234,6 +234,98 @@ def cmd_switch(args):
         print("Set RC switch override to %u (PWM=%u channel=%u)" % (
             value, mapping[value], flite_mode_ch_parm))
 
+def cmd_initdebug(args):
+    cmd_param(['set', 'ARMING_CHECK', 0])
+    cmd_loiter
+    cmd_arm(['throttle'])
+
+minValue=800  # Min value of all sticks. May change depending on controller or APM
+midValue=1500 # Middle value of all sticks. May change depending on controller or APM
+maxValue=2200 # Max value. May change depending on controller or APM
+
+# TODO: A working setalt function. Right now the altitude doesn't update in the while loops
+def cmd_setalt(args):
+    if len(args) != 1:
+        print("Usage: setalt <value>")
+        return
+    currentAlt=mpstate.status.altitude
+    goalAlt = int(args[0])
+    if (goalAlt > currentAlt):
+        cmd_rc([3, maxValue])
+        while(abs(goalAlt - currentAlt) > 2):
+            print("Going higher ", int(currentAlt))
+            time.sleep(0.3)
+            currentAlt=mpstate.status.altitude
+    else:
+        cmd_rc([3, minValue])
+        while(abs(goalAlt - currentAlt) > 2):
+            print("Going lower ", int(currentAlt))
+            time.sleep(0.3)
+            currentAlt=mpstate.status.altitude
+    cmd_rc([3, midValue])
+    
+def calcValue(procent):
+        valproc=float(procent)/100
+        value=(maxValue-midValue)*valproc
+        return value
+
+def cmd_forw(args):
+    if len(args) != 1:
+        print("Usage: forward <procent value>")
+        return
+    val = int(args[0])
+    throttle=midValue
+    if val <= 10:
+        pitch=midValue
+    else:
+        pitch=midValue-(calcValue(val))  
+    print("Throttling at ", throttle, " with pitch: ", pitch)
+    cmd_rc([3, throttle])
+    cmd_rc([2, pitch]) 
+
+def cmd_backw(args):
+    if len(args) != 1:
+        print("Usage: backward <procent value>")
+        return
+    val = int(args[0])
+    throttle=midValue
+    if val <= 10:
+        pitch=midValue
+    else:
+        pitch=(calcValue(val))+midValue
+    print("Throttling at ", throttle, " with pitch: ", pitch)
+    cmd_rc([3, throttle])
+    cmd_rc([2, pitch])
+
+def cmd_left(args):
+    if len(args) != 1:
+        print("Usage: left <procent value>")
+        return
+    val = int(args[0])
+    throttle=midValue
+    if val <= 10:
+        roll=midValue
+    else:
+        roll=(calcValue(val))+midValue
+    print("Throttling at ", throttle, " with roll: ", roll)
+    cmd_rc([3, throttle])
+    cmd_rc([1, roll])
+
+def cmd_right(args):
+    if len(args) != 1:
+        print("Usage: right <procent value>")
+        return
+    val = int(args[0])
+    throttle=midValue
+    if val <= 10:
+        roll=midValue
+    else:
+        roll=midValue-(calcValue(val))
+    print("Throttling at ", throttle, " with roll: ", roll)
+    cmd_rc([3, throttle])
+    cmd_rc([1, roll])
+
+
 def cmd_rc(args):
     '''handle RC value override'''
     if len(args) != 2:
@@ -744,6 +836,7 @@ def cmd_tuneopt(args):
     usage = "usage: tuneopt <set|show|reset|list>"
     if not opts.quadcopter or 'TUNE' not in mpstate.mav_param:
         print("This command is only available for quadcopter")
+#	cmd_tuneopt(6)
         return
     if len(args) < 1:
         print(usage)
@@ -1169,7 +1262,13 @@ command_map = {
     'alias'   : (cmd_alias,    'command aliases'),
     'arm'     : (cmd_arm,      'Copter/Plane arm motors'),
     'time'    : (cmd_time,     'Show autopilot time'),
-    'disarm'  : (cmd_disarm,   'Copter/Plane disarm motors')
+    'disarm'  : (cmd_disarm,   'Copter/Plane disarm motors'),
+    'setalt'  : (cmd_setalt,    'Sets the altitude of the copter'),
+    'forward' : (cmd_forw,      'Move the copter forwards'),
+    'backward' : (cmd_backw,	'Move the copter backwards'),
+    'left' : (cmd_left,	'Make the copter strafe left'),
+    'right' : (cmd_right,	'Make the copter strafe right'),
+    'initdebug' : (cmd_initdebug, 'Makes it able to control the quadcopter without fail-safe (BIG RISK FOR CRASH)')
     }
 
 def process_stdin(line):
@@ -2120,7 +2219,7 @@ Auto-detected serial ports are:
         mpstate.override_period = mavutil.periodic_event(1)
     heartbeat_check_period = mavutil.periodic_event(0.33)
 
-    mpstate.rl = rline.rline("MAV> ", mpstate)
+    mpstate.rl = rline.rline("MAV> ")
     if opts.setup:
         mpstate.rl.set_prompt("")
 
