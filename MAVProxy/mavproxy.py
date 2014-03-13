@@ -236,14 +236,19 @@ def cmd_switch(args):
 
 def cmd_initdebug(args):
     cmd_param(['set', 'ARMING_CHECK', 0])
-    cmd_loiter
     cmd_arm(['throttle'])
+    cmd_loiter
 
-goalAltitude=-1 # Value -1 means it's not set
+# Global variables used to control the vehicle, change these depending on your controller or APM
+chanRoll=1
+chanPitch=2
+chanThrottle=3
+chanYaw=4
+goalAltitude=-1 # Value -1 means it's not yet set
 procentZone=2 # If the feedback procentage is below this %, do nothing
-minValue=800  # Min value of all sticks. May change depending on controller or APM
-midValue=1500 # Middle value of all sticks. May change depending on controller or APM
-maxValue=2200 # Max value. May change depending on controller or APM
+minValue=800  # Min value of all sticks.
+midValue=1500 # Middle value of all sticks.
+maxValue=2200 # Max value.
 
 def cmd_setalt(args):
     if len(args) != 1:
@@ -266,10 +271,7 @@ def cmd_movez(args):
     if (val > 100 or val < -100):
         print ("Usage: movez <procent value (between -100 and 100)>")
         return
-    if (val < 0):
-        cmd_backw([abs(val)])
-    elif (val >= 0):
-        cmd_forw([abs(val)])
+    cmd_movecopter([chanPitch, val])
 
 def cmd_strafe(args):
     if len(args) != 1:
@@ -277,12 +279,9 @@ def cmd_strafe(args):
         return
     val = int(args[0])
     if (val > 100 or val < -100):
-        print ("Usage: movez <procent value (between -100 and 100)>")
+        print ("Usage: strafe <procent value (between -100 and 100)>")
         return
-    if (val < 0):
-        cmd_sleft([abs(val)])
-    elif (val >= 0):
-        cmd_sright([abs(val)])
+    cmd_movecopter([chanRoll, val])
 
 def cmd_yaw(args):
     if len(args) != 1:
@@ -290,101 +289,47 @@ def cmd_yaw(args):
         return
     val = int(args[0])
     if (val > 100 or val < -100):
-        print ("Usage: movez <procent value (between -100 and 100)>")
+        print ("Usage: yaw <procent value (between -100 and 100)>")
         return
-    if (val < 0):
-        cmd_yawleft([abs(val)])
-    elif (val >= 0):
-        cmd_yawright([abs(val)])
+    cmd_movecopter([chanYaw, val])
 
-
-# Help functions to movez, strafe and yaw
-
-def cmd_forw(args):
-    if len(args) != 1:
-        print("Error using cmd_forw, wrong number of arguments")
+def cmd_bend(args):
+    if len(args) != 2:
+        print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
         return
-    val = int(args[0])
+    yawP = int(args[0])
+    pitchP = int(args[1])
+    if (yawP > 100 or yawP < -100 or pitchP > 100 or pitchP < -100):
+        print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
+        return
+    cmd_movecopter([chanYaw, yawP])
+    cmd_movecopter([chanPitch, pitchP])
+
+def cmd_hover(args):
+    print ("Resetting vehicle to stand still loiter mode")
+    cmd_movecopter([chanRoll, 0])
+    cmd_movecopter([chanPitch, 0])
+    cmd_movecopter([chanThrottle, 0])
+    cmd_movecopter([chanYaw, 0])
+    cmd_loiter
+
+# Help function to movez, strafe and yaw
+def cmd_movecopter(args):
+    if len(args) != 2:
+        print("Error using cmd_movecopter, wrong number of arguments")
+        return
+    channel = int(args[0])
+    valProcent = int(args[1])
     throttle=midValue
-    if val <= procentZone:
-        pitch=midValue
+    if abs(valProcent) <= procentZone:
+        rawValue = midValue
+    elif valProcent > 0:
+        rawValue=midValue+(calcValue(abs(valProcent)))
     else:
-        pitch=midValue-(calcValue(val))  
-    print("Throttling at ", throttle, " with pitch: ", pitch)
-    cmd_rc([3, throttle])
-    cmd_rc([2, pitch]) 
-
-def cmd_backw(args):
-    if len(args) != 1:
-        print("Error using cmd_backw, wrong number of arguments")
-        return
-    val = int(args[0])
-    throttle=midValue
-    if val <= procentZone:
-        pitch=midValue
-    else:
-        pitch=(calcValue(val))+midValue
-    print("Throttling at ", throttle, " with pitch: ", pitch)
-    cmd_rc([3, throttle])
-    cmd_rc([2, pitch])
-
-def cmd_sleft(args):
-    if len(args) != 1:
-        print("Error using cmd_sleft, wrong number of arguments")
-        return
-    val = int(args[0])
-    throttle=midValue
-    if val <= procentZone:
-        roll=midValue
-    else:
-        roll=midValue-(calcValue(val))
-    print("Throttling at ", throttle, " with roll: ", roll)
-    cmd_rc([3, throttle])
-    cmd_rc([1, roll])
-
-def cmd_sright(args):
-    if len(args) != 1:
-        print("Error using cmd_sright, wrong number of arguments")
-        return
-    val = int(args[0])
-    throttle=midValue
-    if val <= procentZone:
-        roll=midValue
-    else:
-        roll=(calcValue(val))+midValue
-    print("Throttling at ", throttle, " with roll: ", roll)
-    cmd_rc([3, throttle])
-    cmd_rc([1, roll])
-
-def cmd_yawleft(args):
-    if len(args) != 1:
-        print("Error using cmd_yawleft, wrong number of arguments")
-        return
-    val = int(args[0])
-    throttle=midValue
-    if val <= procentZone:
-        yaw=midValue
-    else:
-        yaw=midValue-(calcValue(val))
-    print("Throttling at ", throttle, " with yaw: ", yaw)
-    cmd_rc([3, throttle])
-    cmd_rc([4, yaw])
-
-def cmd_yawright(args):
-    if len(args) != 1:
-        print("Error using cmd_yawright, wrong number of arguments")
-        return
-    val = int(args[0])
-    throttle=midValue
-    if val <= procentZone:
-        yaw=midValue
-    else:
-        yaw=(calcValue(val))+midValue
-    print("Throttling at ", throttle, " with yaw: ", yaw)
-    cmd_rc([3, throttle])
-    cmd_rc([4, yaw])
-
-# End to help functions for movez, strafe and yaw
+        rawValue=midValue-(calcValue(abs(valProcent)))
+    print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
+    cmd_rc([chanThrottle, throttle])
+    cmd_rc([channel, rawValue])
 
 def cmd_rc(args):
     '''handle RC value override'''
@@ -1334,7 +1279,9 @@ command_map = {
     'setalt'  : (cmd_setalt,    'Sets the altitude of the copter'),
     'movez'   : (cmd_movez,     'Moves the copter forwards or backwards (Parameter: -100 to 100)'),
     'strafe'  : (cmd_strafe,    'Move the copter left or right (Parameter: -100 to 100'),
-    'yaw'     : (cmd_yaw,       'Move the copter by yaw left or right (Parameter: -100 to 100')
+    'yaw'     : (cmd_yaw,       'Move the copter by yaw left or right (Parameter: -100 to 100'),
+    'bend'    : (cmd_bend,      'Move the copter in a curve movement (Parameters: <yaw> <pitch> between -100 and 100)'),
+    'hover'   : (cmd_hover,     'Reset the vehicle to stand still loiter mode in a secure way')
     }
 
 def process_stdin(line):
@@ -2046,25 +1993,28 @@ def main_loop():
                 mpstate.mav_param_set = set()
                 master.param_fetch_all()
         set_stream_rates()
+
     # Change these depending on your Quadcopter / APM
     sweetSpot=0.2 
     upSpeed=100
     downSpeed=300
     global goalAltitude
     global midValue
+    global chanThrottle
     while True:
         if (goalAltitude >= 0):
             altDiff = goalAltitude - float(mpstate.status.altitude)
-            print(altDiff)
+            # print(altDiff)
             if (abs(altDiff) > sweetSpot): # If height is not within sweetSpot correct range
-                print("Goal altitude: ", goalAltitude, " current altitude: ", mpstate.status.altitude)
+                # print("Goal altitude: ", goalAltitude, " current altitude: ", mpstate.status.altitude)
                 if (altDiff > 0):
-                    cmd_rc([3, midValue+upSpeed])
+                    cmd_rc([chanThrottle, midValue+upSpeed])
                 else:
-                    cmd_rc([3, midValue-downSpeed])
+                    cmd_rc([chanThrottle, midValue-downSpeed])
             else:
+                print("Altitude correction complete! Current altitude: ", mpstate.status.altitude)
                 goalAltitude=-1
-                cmd_rc([3, midValue])
+                cmd_rc([chanThrottle, midValue])
         if mpstate is None or mpstate.status.exit:
             return
         if mpstate.rl.line is not None:
