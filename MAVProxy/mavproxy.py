@@ -13,6 +13,7 @@ import serial, Queue, select
 
 import select
 
+from pymavlink import mavutil, mavwp, mavparm
 # allow running without installing
 #sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'))
 
