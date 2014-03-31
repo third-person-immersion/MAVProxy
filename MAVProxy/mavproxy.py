@@ -246,10 +246,11 @@ chanPitch=2
 chanThrottle=3
 chanYaw=4
 goalAltitude=-1 # Value -1 means it's not yet set
-procentZone=2 # If the feedback procentage is below this %, do nothing
+#procentZone=2 # If the feedback procentage is below this %, do nothing
 minValue=800  # Min value of all sticks.
 midValue=1500 # Middle value of all sticks.
 maxValue=2200 # Max value.
+debugMode=True
 
 def cmd_setalt(args):
     if len(args) != 1:
@@ -322,13 +323,15 @@ def cmd_movecopter(args):
     channel = int(args[0])
     valProcent = int(args[1])
     throttle=midValue
-    if abs(valProcent) <= procentZone:
-        rawValue = midValue
-    elif valProcent > 0:
+   # if abs(valProcent) <= procentZone:
+   #     rawValue = midValue
+   # elif valProcent > 0:
+    if valProcent > 0:
         rawValue=midValue+(calcValue(abs(valProcent)))
     else:
         rawValue=midValue-(calcValue(abs(valProcent)))
-    print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
+    if debugMode:
+        print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
     cmd_rc([chanThrottle, throttle])
     cmd_rc([channel, rawValue])
 
