@@ -238,7 +238,7 @@ def cmd_switch(args):
 def cmd_initdebug(args):
     cmd_param(['set', 'ARMING_CHECK', 0])
     cmd_arm(['throttle'])
-    cmd_loiter
+    cmd_althold
 
 # Global variables used to control the vehicle, change these depending on your controller or APM
 chanRoll=1
@@ -313,7 +313,7 @@ def cmd_hover(args):
     cmd_movecopter([chanPitch, 0])
     cmd_movecopter([chanThrottle, 0])
     cmd_movecopter([chanYaw, 0])
-    cmd_loiter
+    cmd_althold
 
 # Help function to movez, strafe and yaw
 def cmd_movecopter(args):
@@ -359,6 +359,11 @@ def cmd_loiter(args):
     '''set LOITER mode'''
     mpstate.master().set_mode_loiter()
 
+def cmd_althold(args):
+    '''set ALTHOLD mode'''
+    mode_mapping = mpstate.master().mode_mapping()
+    mpstate.master().set_mode(mode_mapping['ALT_HOLD'])
+    
 def cmd_auto(args):
     '''set AUTO mode'''
     mpstate.master().set_mode_auto()
@@ -1254,6 +1259,7 @@ command_map = {
     'compassmot': (cmd_compassmot, 'do compass/motor interference calibration'),
     'calpress': (cmd_calpressure,'calibrate pressure sensors'),
     'loiter'  : (cmd_loiter,   'set LOITER mode'),
+    'althold' : (cmd_althold,  'set ALTHOLD mode'),
     'rtl'     : (cmd_rtl,      'set RTL mode'),
     'manual'  : (cmd_manual,   'set MANUAL mode'),
     'fbwa'    : (cmd_fbwa,     'set FBWA mode'),
