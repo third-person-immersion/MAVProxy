@@ -203,3 +203,33 @@ def PILTowx(pimg):
         wimg = wx.EmptyImage(pimg.size[0], pimg.size[1])
         wimg.SetData(pimg.convert('RGB').tostring())
         return wimg
+
+def dot_mavproxy(name):
+        '''return a path to store mavproxy data'''
+        dir = os.path.join(os.environ['HOME'], '.mavproxy')
+        mkdir_p(dir)
+        return os.path.join(dir, name)
+
+def download_url(url):
+    '''download a URL and return the content'''
+    import urllib2
+    try:
+        resp = urllib2.urlopen(url)
+        headers = resp.info()
+    except urllib2.URLError as e:
+        print('Error downloading %s' % url)
+        return None
+    return resp.read()
+
+
+def download_files(files):
+    '''download an array of files'''
+    for (url, file) in files:
+            print("Downloading %s as %s" % (url, file))
+            data = download_url(url)
+            if data is None:
+                    continue
+            try:
+                    open(file, mode='w').write(data)
+            except Exception as e:
+                    print("Failed to save to %s : %s" % (file, e))

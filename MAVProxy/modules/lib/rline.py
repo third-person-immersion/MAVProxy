@@ -14,6 +14,15 @@ class rline(object):
         self.prompt = prompt
         self.line = None
         rline_mpstate = mpstate
+        # other modules can add their own completion functions
+        mpstate.completion_functions = {
+            '(FILENAME)' : complete_filename,
+            '(PARAMETER)' : complete_parameter,
+            '(VARIABLE)' : complete_variable,
+            '(SETTING)' : rline_mpstate.settings.completion,
+            '(COMMAND)' : complete_command,
+            '(ALIAS)' : complete_alias
+            }
         
     def set_prompt(self, prompt):
         if prompt != self.prompt:
@@ -21,27 +30,43 @@ class rline(object):
             sys.stdout.write(prompt)
 
 
-def complete_alias():
+def complete_alias(text):
     '''return list of aliases'''
     global rline_mpstate
     return rline_mpstate.aliases.keys()
 
-def complete_command():
+def complete_command(text):
     '''return list of commands'''
     global rline_mpstate
     return rline_mpstate.command_map.keys()
+
+def complete_filename(text):
+    '''complete a filename'''
+    return glob.glob(text+'*')
+
+def complete_parameter(text):
+    '''complete a parameter'''
+    return rline_mpstate.mav_param.keys()
+
+def complete_variable(text):
+    '''complete a MAVLink variable'''
+    if text.find('.') != -1:
+        var = text.split('.')[0]
+        if var in rline_mpstate.status.msgs:
+            ret = []
+            for f in rline_mpstate.status.msgs[var].get_fieldnames():
+                ret.append(var + '.' + f)
+            return ret
+        return []
+    return rline_mpstate.status.msgs.keys()
 
 def rule_expand(component, text):
     '''expand one rule component'''
     global rline_mpstate
     if component[0] == '<' and component[-1] == '>':
         return component[1:-1].split('|')
-    if component == '(FILENAME)':
-        return glob.glob(text+'*')
-    if component == '(PARAMETER)':
-        return rline_mpstate.mav_param.keys()
-    if component == '(SETTING)':
-        return rline_mpstate.settings.list()
+    if component in rline_mpstate.completion_functions:
+        return rline_mpstate.completion_functions[component](text)
     return [component]        
 
 def rule_match(component, cmd):
@@ -92,7 +117,7 @@ def complete(text, state):
 
     if len(cmd) == 1:
         # if on first part then complete on commands and aliases
-        last_clist = complete_command() + complete_alias()
+        last_clist = complete_command(text) + complete_alias(text)
     elif cmd[0] in rline_mpstate.completions:
         # we have a completion rule for this command
         last_clist = complete_rules(rline_mpstate.completions[cmd[0]], cmd[1:])

@@ -10,10 +10,9 @@ Released under the GNU GPL version 3 or later
 import sys, os, struct, math, time, socket
 import fnmatch, errno, threading
 import serial, Queue, select
-
+import traceback
 import select
 
-from pymavlink import mavutil, mavwp, mavparm
 # allow running without installing
 #sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'))
 
@@ -21,31 +20,20 @@ from pymavlink import mavutil, mavwp, mavparm
 from MAVProxy.modules.lib import textconsole
 from MAVProxy.modules.lib import mp_settings
 from MAVProxy.modules.lib import rline
+from MAVProxy.modules.lib import mp_module
+from MAVProxy.modules.lib import dumpstacks
 
 class MPStatus(object):
     '''hold status information about the mavproxy'''
     def __init__(self):
-        if opts.quadcopter:
-            self.rc_throttle = [ 0.0, 0.0, 0.0, 0.0 ]
-        else:
-            self.rc_aileron  = 0
-            self.rc_elevator = 0
-            self.rc_throttle = 0
-            self.rc_rudder   = 0
         self.gps	 = None
         self.msgs = {}
         self.msg_count = {}
         self.counters = {'MasterIn' : [], 'MasterOut' : 0, 'FGearIn' : 0, 'FGearOut' : 0, 'Slave' : 0}
         self.setup_mode = opts.setup
-        self.wp_op = None
-        self.wp_save_filename = None
-        self.wploader = mavwp.MAVWPLoader()
-        self.loading_waypoints = False
-        self.loading_waypoint_lasttime = time.time()
         self.mav_error = 0
         self.target_system = 1
         self.target_component = 1
-        self.speech = None
         self.altitude = 0
         self.last_altitude_announce = 0.0
         self.last_distance_announce = 0.0
@@ -54,11 +42,7 @@ class MPStatus(object):
         self.battery_level = -1
         self.voltage_level = -1
         self.avionics_battery_level = -1
-        self.last_waypoint = 0
         self.exit = False
-        self.override = [ 0 ] * 8
-        self.last_override = [ 0 ] * 8
-        self.override_counter = 0
         self.flightmode = 'MAV'
         self.last_mode_announce = 0
         self.logdir = None
@@ -75,7 +59,6 @@ class MPStatus(object):
         self.last_streamrate1 = -1
         self.last_streamrate2 = -1
         self.last_seq = 0
-        self.fetch_one = 0
         self.armed = False
 
     def show(self, f, pattern=None):
@@ -98,8 +81,21 @@ class MPStatus(object):
         self.show(f)
         f.close()
 
+def say_text(text, priority='important'):
+    '''text output - default function for say()'''
+    mpstate.console.writeln(text)
+
+def say(text, priority='important'):
+    '''text and/or speech output'''
+    mpstate.functions.say(text, priority)
+
 class MAVFunctions(object):
-    pass
+    '''core functions available in modules'''
+    def __init__(self):
+        self.process_stdin = process_stdin
+        self.param_set = param_set
+        self.get_mav_param = get_mav_param
+        self.say = say_text
 
 class MPState(object):
     '''holds state of mavproxy'''
@@ -107,13 +103,14 @@ class MPState(object):
         self.console = textconsole.SimpleConsole()
         self.map = None
         self.map_functions = {}
+        self.vehicle_type = None
+        self.vehicle_name = None
         self.settings = mp_settings.MPSettings(
             [ ('link', int, 1),
               ('altreadout', int, 10),
               ('distreadout', int, 200),
               ('heartbeat', int, 1),
               ('numcells', int, 1),
-              ('speech', int, 0),
               ('mavfwd', int, 1),
               ('mavfwd_rate', int, 0),
               ('streamrate', int, 4),
@@ -126,17 +123,11 @@ class MPState(object):
               ('shownoise', int, 1),
               ('basealt', int, 0),
               ('wpalt', int, 100),
-              ('parambatch', int, 10)]
+              ('flushlogs', int, 0),
+              ('requireexit', int, 0)]
             )
 
         self.completions = {
-            "wp" : ["<list|clear>",
-                    "<load|update|save> (FILENAME)"],
-            "fence" : ["<draw|list|clear>",
-                       "<load|save> (FILENAME)"],
-            "param" : ["fetch",
-                       "<set|show> (PARAMETER)",
-                       "<load|save> (FILENAME)"],
             "script" : ["(FILENAME)"],
             "set"    : ["(SETTING)"]
             }
@@ -153,16 +144,19 @@ class MPState(object):
         self.sitl_output = None
 
         self.mav_param = mavparm.MAVParmDict()
-        self.mav_param_set = set()
-        self.mav_param_count = 0
         self.modules = []
+        self.public_modules = {}
         self.functions = MAVFunctions()
-        self.functions.say = say
-        self.functions.process_stdin = process_stdin
         self.select_extra = {}
         self.continue_mode = False
         self.aliases = {}
 
+    def module(self, name):
+        '''Find a public module (most modules are private)'''
+        if name in self.public_modules:
+            return self.public_modules[name]
+        return None
+    
     def master(self):
         '''return the currently chosen mavlink master object'''
         if self.settings.link > len(self.mav_master):
@@ -181,518 +175,18 @@ def get_usec():
     '''time since 1970 in microseconds'''
     return int(time.time() * 1.0e6)
 
-def say(text, priority='important'):
-    '''speak some text'''
-    ''' http://cvs.freebsoft.org/doc/speechd/ssip.html see 4.3.1 for priorities'''
-    mpstate.console.writeln(text)
-    if mpstate.settings.speech:
-        import speechd
-        mpstate.status.speech = speechd.SSIPClient('MAVProxy%u' % os.getpid())
-        mpstate.status.speech.set_output_module('festival')
-        mpstate.status.speech.set_language('en')
-        mpstate.status.speech.set_priority(priority)
-        mpstate.status.speech.set_punctuation(speechd.PunctuationMode.SOME)
-        mpstate.status.speech.speak(text)
-        mpstate.status.speech.close()
-
 def get_mav_param(param, default=None):
     '''return a EEPROM parameter value'''
     return mpstate.mav_param.get(param, default)
 
-
-def send_rc_override():
-    '''send RC override packet'''
-    if mpstate.sitl_output:
-        buf = struct.pack('<HHHHHHHH',
-                          *mpstate.status.override)
-        mpstate.sitl_output.write(buf)
-    else:
-        mpstate.master().mav.rc_channels_override_send(mpstate.status.target_system,
-                                                         mpstate.status.target_component,
-                                                         *mpstate.status.override)
-
-def cmd_switch(args):
-    '''handle RC switch changes'''
-    mapping = [ 0, 1165, 1295, 1425, 1555, 1685, 1815 ]
-    if len(args) != 1:
-        print("Usage: switch <pwmvalue>")
-        return
-    value = int(args[0])
-    if value < 0 or value > 6:
-        print("Invalid switch value. Use 1-6 for flight modes, '0' to disable")
-        return
-    if opts.quadcopter:
-        default_channel = 5
-    else:
-        default_channel = 8
-    flite_mode_ch_parm = int(get_mav_param("FLTMODE_CH", default_channel))
-    mpstate.status.override[flite_mode_ch_parm-1] = mapping[value]
-    mpstate.status.override_counter = 10
-    send_rc_override()
-    if value == 0:
-        print("Disabled RC switch override")
-    else:
-        print("Set RC switch override to %u (PWM=%u channel=%u)" % (
-            value, mapping[value], flite_mode_ch_parm))
-
-def cmd_initdebug(args):
-    cmd_param(['set', 'ARMING_CHECK', 0])
-    cmd_arm(['throttle'])
-    cmd_althold
-
-# Global variables used to control the vehicle, change these depending on your controller or APM
-chanRoll=1
-chanPitch=2
-chanThrottle=3
-chanYaw=4
-goalAltitude=-1 # Value -1 means it's not yet set
-#procentZone=2 # If the feedback procentage is below this %, do nothing
-minValue=800  # Min value of all sticks.
-midValue=1500 # Middle value of all sticks.
-maxValue=2200 # Max value.
-debugMode=True
-
-def cmd_setalt(args):
-    if len(args) != 1:
-        print("Usage: setalt <value (in meters)>")
-        return
-    global goalAltitude
-    goalAltitude = float(args[0])
-    print(goalAltitude)
-
-def calcValue(procent):
-        valproc=float(procent)/100
-        value=(maxValue-midValue)*valproc
-        return value
-
-def cmd_movez(args):
-    if len(args) != 1:
-        print ("Usage: movez <procent value (between -100 and 100)>")
-        return
-    val = int(args[0])
-    if (val > 100 or val < -100):
-        print ("Usage: movez <procent value (between -100 and 100)>")
-        return
-    cmd_movecopter([chanPitch, val])
-
-def cmd_strafe(args):
-    if len(args) != 1:
-        print ("Usage: strafe <procent value (between -100 and 100)>")
-        return
-    val = int(args[0])
-    if (val > 100 or val < -100):
-        print ("Usage: strafe <procent value (between -100 and 100)>")
-        return
-    cmd_movecopter([chanRoll, val])
-
-def cmd_yaw(args):
-    if len(args) != 1:
-        print ("Usage: yaw <procent value (between -100 and 100)>")
-        return
-    val = int(args[0])
-    if (val > 100 or val < -100):
-        print ("Usage: yaw <procent value (between -100 and 100)>")
-        return
-    cmd_movecopter([chanYaw, val])
-
-def cmd_bend(args):
-    if len(args) != 2:
-        print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
-        return
-    yawP = int(args[0])
-    pitchP = int(args[1])
-    if (yawP > 100 or yawP < -100 or pitchP > 100 or pitchP < -100):
-        print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
-        return
-    cmd_movecopter([chanYaw, yawP])
-    cmd_movecopter([chanPitch, pitchP])
-
-def cmd_hover(args):
-    print ("Resetting vehicle to stand still loiter mode")
-    cmd_movecopter([chanRoll, 0])
-    cmd_movecopter([chanPitch, 0])
-    cmd_movecopter([chanThrottle, 0])
-    cmd_movecopter([chanYaw, 0])
-    cmd_althold
-
-# Help function to movez, strafe and yaw
-def cmd_movecopter(args):
-    if len(args) != 2:
-        print("Error using cmd_movecopter, wrong number of arguments")
-        return
-    channel = int(args[0])
-    valProcent = int(args[1])
-    throttle=midValue
-   # if abs(valProcent) <= procentZone:
-   #     rawValue = midValue
-   # elif valProcent > 0:
-    if valProcent > 0:
-        rawValue=midValue+(calcValue(abs(valProcent)))
-    else:
-        rawValue=midValue-(calcValue(abs(valProcent)))
-    if debugMode:
-        print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
-    cmd_rc([chanThrottle, throttle])
-    cmd_rc([channel, rawValue])
-
-def cmd_rc(args):
-    '''handle RC value override'''
-    if len(args) != 2:
-        print("Usage: rc <channel|all> <pwmvalue>")
-        return
-    value   = int(args[1])
-    if value == -1:
-        value = 65535
-    if args[0] == 'all':
-        for i in range(8):
-            mpstate.status.override[i] = value
-    else:
-        channel = int(args[0])
-        mpstate.status.override[channel-1] = value
-        if channel < 1 or channel > 8:
-            print("Channel must be between 1 and 8 or 'all'")
-            return
-    mpstate.status.override_counter = 10
-    send_rc_override()
-
-def cmd_loiter(args):
-    '''set LOITER mode'''
-    mpstate.master().set_mode_loiter()
-
-def cmd_althold(args):
-    '''set ALTHOLD mode'''
-    mode_mapping = mpstate.master().mode_mapping()
-    mpstate.master().set_mode(mode_mapping['ALT_HOLD'])
-    
-def cmd_auto(args):
-    '''set AUTO mode'''
-    mpstate.master().set_mode_auto()
-
-def cmd_ground(args):
-    '''do a ground start mode'''
-    mpstate.master().calibrate_imu()
-
-def cmd_level(args):
-    '''run a accel level'''
-    mpstate.master().calibrate_level()
-
-def cmd_mode(args):
-    '''set arbitrary mode'''
-    mode_mapping = mpstate.master().mode_mapping()
-    if mode_mapping is None:
-        print('No mode mapping available')
-        return
-    if len(args) != 1:
-        print('Available modes: ', mode_mapping.keys())
-        return
-    mode = args[0].upper()
-    if mode not in mode_mapping:
-        print('Unknown mode %s: ' % mode)
-        return
-    mpstate.master().set_mode(mode_mapping[mode])
-
-def cmd_accelcal(args):
-    '''do a full 3D accel calibration'''
-    mav = mpstate.master()
-    # ack the APM to begin 3D calibration of accelerometers
-    mav.mav.command_long_send(mav.target_system, mav.target_component,
-                              mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION, 0,
-                              0, 0, 0, 0, 1, 0, 0)
-    count = 0
-    # we expect 6 messages and acks
-    while count < 6:
-        m = mav.recv_match(type='STATUSTEXT', blocking=True)
-        text = str(m.text)
-        if not text.startswith('Place '):
-            continue
-        # wait for user to hit enter
-        mpstate.rl.line = None
-        while mpstate.rl.line is None:
-            time.sleep(0.1)
-        mpstate.rl.line = None
-        count += 1
-        # tell the APM that we've done as requested
-        mav.mav.command_ack_send(count, 1)
-
-
-def cmd_compassmot(args):
-    '''do a compass/motor interference calibration'''
-    mav = mpstate.master()
-    print("compassmot starting")
-    mav.mav.command_long_send(mav.target_system, mav.target_component,
-                              mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION, 0,
-                              0, 0, 0, 0, 0, 1, 0)
-    mpstate.rl.line = None
-    while True:
-        m = mav.recv_match(type=['COMMAND_ACK','COMPASSMOT_STATUS'], blocking=False)
-        if m is not None:
-            print(m)
-            if m.get_type() == 'COMMAND_ACK':
-                break
-        if mpstate.rl.line is not None:
-            # user has hit enter, stop the process
-            mav.mav.command_ack_send(0, 1)
-            break
-        time.sleep(0.01)
-    print("compassmot done")
-
-
+def param_set(name, value, retries=3):
+    '''set a parameter'''
+    name = name.upper()
+    return mpstate.mav_param.mavset(mpstate.master(), name, value, retries=retries)
 
 def cmd_reboot(args):
     '''reboot autopilot'''
     mpstate.master().reboot_autopilot()
-
-def cmd_calpressure(args):
-    '''calibrate pressure sensors'''
-    mpstate.master().calibrate_pressure()
-
-def cmd_rtl(args):
-    '''set RTL mode'''
-    mpstate.master().set_mode_rtl()
-
-def cmd_manual(args):
-    '''set MANUAL mode'''
-    mpstate.master().set_mode_manual()
-
-def cmd_servo(args):
-    '''set a servo'''
-    if len(args) != 2:
-        print("Usage: servo <channel> <pwmvalue>")
-        return
-    channel = int(args[0])
-    value   = int(args[1])
-    mpstate.master().set_servo(channel, value)
-
-def cmd_fbwa(args):
-    '''set FBWA mode'''
-    mpstate.master().set_mode_fbwa()
-
-def cmd_guided(args):
-    '''set GUIDED target'''
-    if len(args) != 1:
-        print("Usage: guided ALTITUDE")
-        return
-    try:
-        latlon = mpstate.map_state.click_position
-    except Exception:
-        print("No map available")
-        return
-    if latlon is None:
-        print("No map click position available")
-        return        
-    altitude = int(args[0])
-    print("Guided %s %d" % (str(latlon), altitude))
-    mpstate.master().mav.mission_item_send(mpstate.status.target_system,
-                                           mpstate.status.target_component,
-                                           0,
-                                           mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                                           mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                                           2, 0, 0, 0, 0, 0,
-                                           latlon[0], latlon[1], altitude)
-
-def process_waypoint_request(m, master):
-    '''process a waypoint request from the master'''
-    if (not mpstate.status.loading_waypoints or
-        time.time() > mpstate.status.loading_waypoint_lasttime + 10.0):
-        mpstate.status.loading_waypoints = False
-        mpstate.console.error("not loading waypoints")
-        return
-    if m.seq >= mpstate.status.wploader.count():
-        mpstate.console.error("Request for bad waypoint %u (max %u)" % (m.seq, mpstate.status.wploader.count()))
-        return
-    wp = mpstate.status.wploader.wp(m.seq)
-    wp.target_system = mpstate.status.target_system
-    wp.target_component = mpstate.status.target_component
-    master.mav.send(mpstate.status.wploader.wp(m.seq))
-    mpstate.status.loading_waypoint_lasttime = time.time()
-    mpstate.console.writeln("Sent waypoint %u : %s" % (m.seq, mpstate.status.wploader.wp(m.seq)))
-    if m.seq == mpstate.status.wploader.count() - 1:
-        mpstate.status.loading_waypoints = False
-        mpstate.console.writeln("Sent all %u waypoints" % mpstate.status.wploader.count())
-
-def load_waypoints(filename):
-    '''load waypoints from a file'''
-    mpstate.status.wploader.target_system = mpstate.status.target_system
-    mpstate.status.wploader.target_component = mpstate.status.target_component
-    try:
-        mpstate.status.wploader.load(filename)
-    except Exception, msg:
-        print("Unable to load %s - %s" % (filename, msg))
-        return
-    print("Loaded %u waypoints from %s" % (mpstate.status.wploader.count(), filename))
-
-    mpstate.master().waypoint_clear_all_send()
-    if mpstate.status.wploader.count() == 0:
-        return
-
-    mpstate.status.loading_waypoints = True
-    mpstate.status.loading_waypoint_lasttime = time.time()
-    mpstate.master().waypoint_count_send(mpstate.status.wploader.count())
-
-def update_waypoints(filename, wpnum):
-    '''update waypoints from a file'''
-    mpstate.status.wploader.target_system = mpstate.status.target_system
-    mpstate.status.wploader.target_component = mpstate.status.target_component
-    try:
-        mpstate.status.wploader.load(filename)
-    except Exception, msg:
-        print("Unable to load %s - %s" % (filename, msg))
-        return
-    if mpstate.status.wploader.count() == 0:
-        print("No waypoints found in %s" % filename)
-        return
-    if wpnum == -1:
-        print("Loaded %u updated waypoints from %s" % (mpstate.status.wploader.count(), filename))
-    elif wpnum >= mpstate.status.wploader.count():
-        print("Invalid waypoint number %u" % wpnum)
-        return
-    else:
-        print("Loaded updated waypoint %u from %s" % (wpnum, filename))
-
-    mpstate.status.loading_waypoints = True
-    mpstate.status.loading_waypoint_lasttime = time.time()
-    if wpnum == -1:
-        start = 0
-        end = mpstate.status.wploader.count()-1
-    else:
-        start = wpnum
-        end = wpnum
-    mpstate.master().mav.mission_write_partial_list_send(mpstate.status.target_system,
-                                                         mpstate.status.target_component,
-                                                         start, end)
-
-def save_waypoints(filename):
-    '''save waypoints to a file'''
-    try:
-        mpstate.status.wploader.save(filename)
-    except Exception, msg:
-        print("Failed to save %s - %s" % (filename, msg))
-        return
-    print("Saved %u waypoints to %s" % (mpstate.status.wploader.count(), filename))
-
-def wp_draw_callback(points):
-    '''callback from drawing waypoints'''
-    if len(points) < 3:
-        return
-    from MAVProxy.modules.lib import mp_util
-    home = mpstate.status.wploader.wp(0)
-    mpstate.status.wploader.clear()
-    mpstate.status.wploader.target_system = mpstate.status.target_system
-    mpstate.status.wploader.target_component = mpstate.status.target_component
-    mpstate.status.wploader.add(home)
-    for p in points:
-        mpstate.status.wploader.add_latlonalt(p[0], p[1], mpstate.settings.wpalt)
-    mpstate.master().waypoint_clear_all_send()
-    if mpstate.status.wploader.count() == 0:
-        return
-    mpstate.status.loading_waypoints = True
-    mpstate.status.loading_waypoint_lasttime = time.time()
-    mpstate.master().waypoint_count_send(mpstate.status.wploader.count())
-
-def wp_loop():
-    '''close the loop on a mission'''
-    loader = mpstate.status.wploader
-    if loader.count() < 2:
-        print("Not enough waypoints (%u)" % loader.count())
-        return
-    wp = loader.wp(loader.count()-2)
-    if wp.command == mavutil.mavlink.MAV_CMD_DO_JUMP:
-        print("Mission is already looped")
-        return
-    wp = mavutil.mavlink.MAVLink_mission_item_message(0, 0, 0, 0, mavutil.mavlink.MAV_CMD_DO_JUMP,
-                                                      0, 1, 1, -1, 0, 0, 0, 0, 0)
-    loader.add(wp)
-    loader.add(loader.wp(1))
-    mpstate.status.loading_waypoints = True
-    mpstate.status.loading_waypoint_lasttime = time.time()
-    mpstate.master().waypoint_count_send(mpstate.status.wploader.count())
-    print("Closed loop on mission")
-
-def set_home_location():
-    '''set home location from last map click'''
-    try:
-        latlon = mpstate.map_state.click_position
-    except Exception:
-        print("No map available")
-        return
-    lat = float(latlon[0])
-    lon = float(latlon[1])
-    if mpstate.status.wploader.count() == 0:
-        mpstate.status.wploader.add_latlonalt(lat, lon, 0)
-    w = mpstate.status.wploader.wp(0)
-    w.x = lat
-    w.y = lon
-    mpstate.status.wploader.set(w, 0)
-    mpstate.status.loading_waypoints = True
-    mpstate.status.loading_waypoint_lasttime = time.time()
-    mpstate.master().mav.mission_write_partial_list_send(mpstate.status.target_system,
-                                                         mpstate.status.target_component,
-                                                         0, 0)
-    
-
-def cmd_wp(args):
-    '''waypoint commands'''
-    if len(args) < 1:
-        print("usage: wp <list|load|update|save|set|clear|loop>")
-        return
-
-    if args[0] == "load":
-        if len(args) != 2:
-            print("usage: wp load <filename>")
-            return
-        load_waypoints(args[1])
-    elif args[0] == "update":
-        if len(args) < 2:
-            print("usage: wp update <filename> <wpnum>")
-            return
-        if len(args) == 3:
-            wpnum = int(args[2])
-        else:
-            wpnum = -1
-        update_waypoints(args[1], wpnum)
-    elif args[0] == "list":
-        mpstate.status.wp_op = "list"
-        mpstate.master().waypoint_request_list_send()
-    elif args[0] == "save":
-        if len(args) != 2:
-            print("usage: wp save <filename>")
-            return
-        mpstate.status.wp_save_filename = args[1]
-        mpstate.status.wp_op = "save"
-        mpstate.master().waypoint_request_list_send()
-    elif args[0] == "savelocal":
-        if len(args) != 2:
-            print("usage: wp savelocal <filename>")
-            return
-        mpstate.status.wploader.save(args[1])
-    elif args[0] == "show":
-        if len(args) != 2:
-            print("usage: wp show <filename>")
-            return
-        mpstate.status.wploader.load(args[1])
-    elif args[0] == "set":
-        if len(args) != 2:
-            print("usage: wp set <wpindex>")
-            return
-        mpstate.master().waypoint_set_current_send(int(args[1]))
-    elif args[0] == "clear":
-        mpstate.master().waypoint_clear_all_send()
-    elif args[0] == "draw":
-        if not 'draw_lines' in mpstate.map_functions:
-            print("No map drawing available")
-            return        
-        if mpstate.status.wploader.count() == 0:
-            print("Need home location - refresh waypoints")
-            return
-        mpstate.map_functions['draw_lines'](wp_draw_callback)
-        print("Drawing waypoints on map")
-    elif args[0] == "sethome":
-        set_home_location()        
-    elif args[0] == "loop":
-        wp_loop()        
-    else:
-        print("Usage: wp <list|load|save|set|show|clear|draw|loop>")
-
 
 def cmd_script(args):
     '''run a script'''
@@ -702,182 +196,9 @@ def cmd_script(args):
 
     run_script(args[0])
 
-def param_set(name, value, retries=3):
-    '''set a parameter'''
-    name = name.upper()
-    return mpstate.mav_param.mavset(mpstate.master(), name, value, retries=retries)
-
-
-def cmd_param(args):
-    '''control parameters'''
-    param_wildcard = "*"
-    if len(args) < 1:
-        print("usage: param <fetch|edit|set|show|diff>")
-        return
-    if args[0] == "fetch":
-        if len(args) == 1:
-            mpstate.master().param_fetch_all()
-            mpstate.mav_param_set = set()
-            print("Requested parameter list")
-        else:
-            for p in mpstate.mav_param.keys():
-                if fnmatch.fnmatch(p, args[1].upper()):
-                    mpstate.master().param_fetch_one(p)
-                    mpstate.status.fetch_one += 1
-                    print("Requested parameter %s" % p)
-    elif args[0] == "save":
-        if len(args) < 2:
-            print("usage: param save <filename> [wildcard]")
-            return
-        if len(args) > 2:
-            param_wildcard = args[2]
-        else:
-            param_wildcard = "*"
-        mpstate.mav_param.save(args[1], param_wildcard, verbose=True)
-    elif args[0] == "diff":
-        if len(args) < 2:
-            if opts.aircraft is not None:
-                filename = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(mpstate.status.logdir))), 'mavdefault.txt')
-            else:
-                print("Usage: param diff <filename>")
-        else:
-            filename = args[1]
-        if len(args) == 3:
-            wildcard = args[2]
-        else:
-            wildcard = '*'
-        mpstate.mav_param.diff(filename, wildcard=wildcard)
-    elif args[0] == "set":
-        if len(args) != 3:
-            print("Usage: param set PARMNAME VALUE")
-            return
-        param = args[1]
-        value = args[2]
-        if not param.upper() in mpstate.mav_param:
-            print("Unable to find parameter '%s'" % param)
-            return
-        param_set(param, value)
-    elif args[0] == "load":
-        if len(args) < 2:
-            print("Usage: param load <filename> [wildcard]")
-            return
-        if len(args) > 2:
-            param_wildcard = args[2]
-        else:
-            param_wildcard = "*"
-        mpstate.mav_param.load(args[1], param_wildcard, mpstate.master())
-    elif args[0] == "show":
-        if len(args) > 1:
-            pattern = args[1]
-        else:
-            pattern = "*"
-        mpstate.mav_param.show(pattern)
-    else:
-        print("Unknown subcommand '%s' (try 'fetch', 'save', 'set', 'show', 'load')" % args[0])
-
 def cmd_set(args):
     '''control mavproxy options'''
-    if len(args) == 0:
-        mpstate.settings.show_all()
-        return
-
-    if getattr(mpstate.settings, args[0], None) is None:
-        print("Unknown setting '%s'" % args[0])
-        return
-    if len(args) == 1:
-        mpstate.settings.show(args[0])
-    else:
-        mpstate.settings.set(args[0], args[1])
-
-tune_options = {
-    'None':             '0',
-    'StabRollPitchkP':  '1',
-    'RateRollPitchkP':  '4',
-    'RateRollPitchkI':  '6',
-    'RateRollPitchkD':  '21',
-    'StabYawkP':        '3',
-    'RateYawkP':        '6',
-    'RateYawkD':        '26',
-    'AltitudeHoldkP':   '14',
-    'ThrottleRatekP':   '7',
-    'ThrottleRatekD':   '37',
-    'ThrottleAccelkP':  '34',
-    'ThrottleAccelkI':  '35',
-    'ThrottleAccelkD':  '36',
-    'LoiterPoskP':      '12',
-    'LoiterRatekP':     '22',
-    'LoiterRatekI':     '28',
-    'LoiterRatekD':     '29',
-    'WPSpeed':          '10',
-    'AcroRollPitch kP': '25',
-    'AcroYawkP':        '40',
-    'RelayOnOff':       '9',
-    'HeliExtGyro':      '13',
-    'OFLoiterkP':       '17',
-    'OFLoiterkI':       '18',
-    'OFLoiterkD':       '19',
-    'AHRSYawkP':        '30',
-    'AHRSkP':           '31',
-    'INAV_TC':          '32',
-    'Declination':      '38',
-    'CircleRate':       '39',
-    'SonarGain':       '41',
-}
-
-def tune_show():
-    opt_num = str(int(get_mav_param('TUNE')))
-    option = None
-    for k in tune_options.keys():
-        if opt_num == tune_options[k]:
-            option = k
-            break
-    else:
-        print("TUNE is currently set to unknown value " + opt_num)
-        return
-    low = get_mav_param('TUNE_LOW')
-    high = get_mav_param('TUNE_HIGH')
-    print("TUNE is currently set to %s LOW=%f HIGH=%f" % (option, low/1000, high/1000))
-
-def tune_option_validate(option):
-    for k in tune_options:
-        if option.upper() == k.upper():
-            return k
-    return None
-
-# TODO: Check/show the limits of LOW and HIGH
-def cmd_tuneopt(args):
-    '''Select option for Tune Pot on Channel 6 (quadcopter only)'''
-    usage = "usage: tuneopt <set|show|reset|list>"
-    if not opts.quadcopter or 'TUNE' not in mpstate.mav_param:
-        print("This command is only available for quadcopter")
-#	cmd_tuneopt(6)
-        return
-    if len(args) < 1:
-        print(usage)
-        return
-    if args[0].lower() == 'reset':
-        param_set('TUNE', '0')
-    elif args[0].lower() == 'set':
-        if len(args) < 4:
-            print('Usage: tuneopt set OPTION LOW HIGH')
-            return
-        option = tune_option_validate(args[1])
-        if not option:
-            print('Invalid Tune option: ' + args[1])
-            return
-        low = args[2]
-        high = args[3]
-        param_set('TUNE', tune_options[option])
-        param_set('TUNE_LOW', float(low) * 1000)
-        param_set('TUNE_HIGH', float(high) * 1000)
-    elif args[0].lower() == 'show':
-        tune_show()
-    elif args[0].lower() == 'list':
-        print("Options available:")
-        for s in sorted(tune_options.keys()):
-            print('  ' + s)
-    else:
-        print(usage)
+    mpstate.settings.command(args)
 
 def cmd_status(args):
     '''show status'''
@@ -914,88 +235,6 @@ def cmd_up(args):
     print("Adjusting TRIM_PITCH_CD from %d to %d" % (old_trim, new_trim))
     param_set('TRIM_PITCH_CD', new_trim)
 
-aux_options = {
-    "Nothing":"0",
-    "Flip":"2",
-    "SimpleMode":"3",
-    "RTL":"4",
-    "SaveTrim":"5",
-    "SaveWP":"7",
-    "MultiMode":"8",
-    "CameraTrigger":"9",
-    "Sonar":"10",
-    "Fence":"11",
-    "ResetYaw":"12",
-    "SuperSimpleMode":"13",
-    "AcroTrainer":"14",
-    "Auto":"16",
-    "AutoTune":"17",
-    "Land":"18"
-}
-
-def aux_show(channel):
-    param = "CH%s_OPT" % channel
-    opt_num = str(int(get_mav_param(param)))
-    option = None
-    for k in aux_options.keys():
-        if opt_num == aux_options[k]:
-            option = k
-            break
-    else:
-        print("AUX Channel is currently set to unknown value " + opt_num)
-        return
-    print("AUX Channel is currently set to " + option)
-
-def aux_option_validate(option):
-    for k in aux_options:
-        if option.upper() == k.upper():
-            return k
-    return None
-
-def cmd_auxopt(args):
-    '''handle AUX switches (CH7, CH8) settings'''
-    if not opts.quadcopter or 'CH7_OPT' not in mpstate.mav_param:
-        print("This command is only available for quadcopter")
-        return
-    if len(args) == 0 or args[0] not in ('set', 'show', 'reset', 'list'):
-        print("Usage: auxopt set|show|reset|list")
-        return
-    if args[0] == 'list':
-        print("Options available:")
-        for s in sorted(aux_options.keys()):
-            print('  ' + s)
-    elif args[0] == 'show':
-        if len(args) > 2 and args[1] not in ['7', '8', 'all']:
-            print("Usage: auxopt show [7|8|all]")
-            return
-        if len(args) < 2 or args[1] == 'all':
-            aux_show('7')
-            aux_show('8')
-            return
-        aux_show(args[1])
-    elif args[0] == 'reset':
-        if len(args) < 2 or args[1] not in ['7', '8', 'all']:
-            print("Usage: auxopt reset 7|8|all")
-            return
-        if args[1] == 'all':
-            param_set('CH7_OPT', '0')
-            param_set('CH8_OPT', '0')
-            return
-        param = "CH%s_OPT" % args[1]
-        param_set(param, '0')
-    elif args[0] == 'set':
-        if len(args) < 3 or args[1] not in ['7', '8']:
-            print("Usage: auxopt set 7|8 OPTION")
-            return
-        option = aux_option_validate(args[2])
-        if not option:
-            print("Invalid option " + args[2])
-            return
-        param = "CH%s_OPT" % args[1]
-        param_set(param, aux_options[option])
-    else:
-        print("Usage: auxopt set|show|list")
-
 def cmd_setup(args):
     mpstate.status.setup_mode = True
     mpstate.rl.set_prompt("")
@@ -1025,6 +264,47 @@ def cmd_watch(args):
     mpstate.status.watch = args[0]
     print("Watching %s" % mpstate.status.watch)
 
+def load_module(modname, quiet=False):
+    '''load a module'''
+    modpaths = ['MAVProxy.modules.mavproxy_%s' % modname, modname]
+    for (m,pm) in mpstate.modules:
+        if m.name == modname:
+            if not quiet:
+                print("module %s already loaded" % modname)
+            return False
+    for modpath in modpaths:
+        try:
+            m = import_package(modpath)
+            reload(m)
+            module = m.init(mpstate)
+            if isinstance(module, mp_module.MPModule):
+                mpstate.modules.append((module, m))
+                if not quiet:
+                    print("Loaded module %s" % (modname,))
+                return True
+            else:
+                ex = "%s.init did not return a MPModule instance" % modname
+                break
+        except ImportError, msg:
+            ex = msg
+            if mpstate.settings.moddebug > 1:
+                import traceback
+                print traceback.format_exc()
+    print("Failed to load module: %s" % ex)
+    return False
+
+def unload_module(modname):
+    '''unload a module'''
+    for (m,pm) in mpstate.modules:
+        if m.name == modname:
+            if hasattr(m, 'unload'):
+                m.unload()
+            mpstate.modules.remove((m,pm))
+            print("Unloaded module %s" % modname)
+            return True
+    print("Unable to find module %s" % modname)
+    return False
+
 def cmd_module(args):
     '''module commands'''
     usage = "usage: module <list|load|reload|unload>"
@@ -1032,57 +312,35 @@ def cmd_module(args):
         print(usage)
         return
     if args[0] == "list":
-        for m in mpstate.modules:
-            print("%s: %s" % (m.name(), m.description()))
+        for (m,pm) in mpstate.modules:
+            print("%s: %s" % (m.name, m.description))
     elif args[0] == "load":
         if len(args) < 2:
             print("usage: module load <name>")
             return
-        modname = args[1]
-        modpaths = ['MAVProxy.modules.mavproxy_%s' % modname, modname]
-        for modpath in modpaths:
-            try:
-                m = import_package(modpath)
-                if m in mpstate.modules:
-                    raise RuntimeError("module %s already loaded" % (modname,))
-                m.init(mpstate)
-                mpstate.modules.append(m)
-                print("Loaded module %s" % (modname,))
-                return
-            except ImportError, msg:
-                ex = msg
-                if mpstate.settings.moddebug > 1:
-                    import traceback
-                    print traceback.format_exc()
-        print("Failed to load module: %s" % ex)
+        load_module(args[1])
     elif args[0] == "reload":
         if len(args) < 2:
             print("usage: module reload <name>")
             return
         modname = args[1]
-        for m in mpstate.modules:
-            if m.name() == modname:
-                try:
-                    m.unload()
-                except Exception:
-                    pass
-                reload(m)
-                m.init(mpstate)
+        pmodule = None
+        for (m,pm) in mpstate.modules:
+            if m.name == modname:
+                pmodule = pm
+        if pmodule is None:
+            print("Module %s not loaded" % modname)
+            return
+        if unload_module(modname):
+            reload(pmodule)
+            if load_module(modname, quiet=True):
                 print("Reloaded module %s" % modname)
-                return
-        print("Unable to find module %s" % modname)
     elif args[0] == "unload":
         if len(args) < 2:
             print("usage: module unload <name>")
             return
         modname = os.path.basename(args[1])
-        for m in mpstate.modules:
-            if m.name() == modname:
-                m.unload()
-                mpstate.modules.remove(m)
-                print("Unloaded module %s" % modname)
-                return
-        print("Unable to find module %s" % modname)
+        unload_module(modname)
     else:
         print(usage)
 
@@ -1117,104 +375,6 @@ def cmd_alias(args):
         print(usage)
         return
 
-def cmd_arm(args):
-    '''arm commands'''
-    usage = "usage: arm <check|uncheck|list|throttle>"
-    checkables = "<all|baro|compass|gps|ins|params|rc|voltage|battery>"
-
-    if len(args) > 0:
-        if args[0] == "check":
-            if (len(args) < 2):
-                print "usage: arm check", checkables
-                return
-            
-            arming_mask = int(mpstate.mav_param["ARMING_CHECK"])
-
-            if (args[1] == "all"):
-                arming_mask |= 0x0001
-            elif (args[1] == "baro"):
-                arming_mask |= 0x0002
-            elif (args[1] == "compass"):
-                arming_mask |= 0x0004
-            elif (args[1] == "gps"):
-                arming_mask |= 0x0008
-            elif (args[1] == "ins"):
-                arming_mask |= 0x0010
-            elif (args[1] == "params"):
-                arming_mask |= 0x0020
-            elif (args[1] == "rc"):
-                arming_mask |= 0x0030
-            elif (args[1] == "voltage"):
-                arming_mask |= 0x0040
-            elif (args[1] == "battery"):
-                arming_mask |= 0x0100
-            else:
-                print "unrecognized arm check:", args[1]
-                return
-
-            param_set("ARMING_CHECK", arming_mask)
-        elif args[0] == "uncheck":
-            if (len(args) < 2):
-                print "usage: arm uncheck", checkables
-                return
-
-            arming_mask = int(mpstate.mav_param["ARMING_CHECK"])
-
-            if (args[1] == "all"):
-                arming_mask ^= 0x0001
-            elif (args[1] == "baro"):
-                arming_mask ^= 0x0002
-            elif (args[1] == "compass"):
-                arming_mask ^= 0x0004
-            elif (args[1] == "gps"):
-                arming_mask ^= 0x0008
-            elif (args[1] == "ins"):
-                arming_mask ^= 0x0010
-            elif (args[1] == "params"):
-                arming_mask ^= 0x0020
-            elif (args[1] == "rc"):
-                arming_mask ^= 0x0040
-            elif (args[1] == "voltage"):
-                arming_mask ^= 0x0080
-            elif (args[1] == "battery"):
-                arming_mask ^= 0x0100
-            else:
-                print "unrecognized arm check:", args[1]
-                return
-
-            param_set("ARMING_CHECK", arming_mask)
-
-        elif args[0] == "list":
-            arming_mask = int(mpstate.mav_param["ARMING_CHECK"])
-            if (arming_mask & 0x0001 != 0):
-                print "ALL"
-            if (arming_mask & 0x0002 != 0):
-                print "BARO"
-            if (arming_mask & 0x0004 != 0):
-                print "COMPASS"
-            if (arming_mask & 0x0008 != 0):
-                print "GPS"
-            if (arming_mask & 0x0010 != 0):
-                print "INS"
-            if (arming_mask & 0x0020 != 0):
-                print "PARAMETERS"
-            if (arming_mask & 0x0040 != 0):
-                print "RC"
-            if (arming_mask & 0x0080 != 0):
-                print "VOLTAGE"
-            if (arming_mask & 0x0100 != 0):
-                print "BATTERY"
-
-        elif args[0] == "throttle":
-            mpstate.master().arducopter_arm()
-        else:
-            print(usage)
-            return
-    else:
-        print(usage)
-        return
-
-
 def cmd_time(args):
   '''show autopilot time'''
   tusec = mpstate.master().field('SYSTEM_TIME', 'time_unix_usec', 0)
@@ -1223,10 +383,6 @@ def cmd_time(args):
       return
   print("%s (%s)\n" % (time.ctime(tusec * 1.0e-6), time.ctime()))
 
-
-def cmd_disarm(args):
-  '''disarm motors'''
-  mpstate.master().arducopter_disarm()
 
 # http://stackoverflow.com/questions/211100/pythons-import-doesnt-work-as-expected
 # has info on why this is necessary.
@@ -1242,15 +398,11 @@ def import_package(name):
 
 
 command_map = {
-    'switch'  : (cmd_switch,   'set RC switch (1-5), 0 disables'),
-    'rc'      : (cmd_rc,       'override a RC channel value'),
-    'wp'      : (cmd_wp,       'waypoint management'),
     'script'  : (cmd_script,   'run a script of MAVProxy commands'),
-    'param'   : (cmd_param,    'manage APM parameters'),
-    'tuneopt' : (cmd_tuneopt,  'Select option for Tune Pot on Channel 6 (quadcopter only)'),
     'setup'   : (cmd_setup,    'go into setup mode'),
     'reset'   : (cmd_reset,    'reopen the connection to the MAVLink master'),
     'status'  : (cmd_status,   'show status'),
+<<<<<<< HEAD
     'auto'    : (cmd_auto,     'set AUTO mode'),
     'mode'    : (cmd_mode,     'set a mode'),
     'ground'  : (cmd_ground,   'do a ground start'),
@@ -1264,34 +416,18 @@ command_map = {
     'manual'  : (cmd_manual,   'set MANUAL mode'),
     'fbwa'    : (cmd_fbwa,     'set FBWA mode'),
     'guided'  : (cmd_guided,   'set GUIDED target'),
+=======
+>>>>>>> upstream/master
     'set'     : (cmd_set,      'mavproxy settings'),
     'bat'     : (cmd_bat,      'show battery levels'),
     'alt'     : (cmd_alt,      'show relative altitude'),
     'link'    : (cmd_link,     'show link status'),
-    'servo'   : (cmd_servo,    'set a servo value'),
     'reboot'  : (cmd_reboot,   'reboot the autopilot'),
     'up'      : (cmd_up,       'adjust TRIM_PITCH_CD up by 5 degrees'),
-    'auxopt'  : (cmd_auxopt,   'select option for aux switches on CH7 and CH8 (ArduCopter only)'),
     'watch'   : (cmd_watch,    'watch a MAVLink pattern'),
     'module'  : (cmd_module,   'module commands'),
     'alias'   : (cmd_alias,    'command aliases'),
-    'arm'     : (cmd_arm,      'Copter/Plane arm motors'),
     'time'    : (cmd_time,     'Show autopilot time'),
-    'disarm'  : (cmd_disarm,   'Copter/Plane disarm motors'),
-    # Debug commands
-    # 'forward' : (cmd_forw,      'Move the copter forwards (Use movez instead)'),
-    # 'backward' : (cmd_backw,	'Move the copter backwards (Use movez instead)'),
-    # 'strafeleft' : (cmd_sleft,	'Make the copter strafe left'),
-    # 'straferight' : (cmd_sright,	'Make the copter strafe right'),
-    # 'yawleft' : (cmd_yawleft,     'Yaw the copter to the left'),
-    # 'yawright' : (cmd_yawright,    'Yaw the copter to the right'),
-    'initdebug' : (cmd_initdebug, 'Makes it able to control the quadcopter without fail-safe (BIG RISK FOR CRASH)'),
-    'setalt'  : (cmd_setalt,    'Sets the altitude of the copter'),
-    'movez'   : (cmd_movez,     'Moves the copter forwards or backwards (Parameter: -100 to 100)'),
-    'strafe'  : (cmd_strafe,    'Move the copter left or right (Parameter: -100 to 100'),
-    'yaw'     : (cmd_yaw,       'Move the copter by yaw left or right (Parameter: -100 to 100'),
-    'bend'    : (cmd_bend,      'Move the copter in a curve movement (Parameters: <yaw> <pitch> between -100 and 100)'),
-    'hover'   : (cmd_hover,     'Reset the vehicle to stand still loiter mode in a secure way')
     }
 
 def process_stdin(line):
@@ -1331,7 +467,20 @@ def process_stdin(line):
             (fn, help) = command_map[cmd]
             print("%-15s : %s" % (cmd, help))
         return
+    if cmd == 'exit' and mpstate.settings.requireexit:
+        reply = raw_input("Are you sure you want to exit? (y/N)")
+        if reply.lower() == 'y':
+            mpstate.status.exit = True
+        return
+
     if not cmd in command_map:
+        for (m,pm) in mpstate.modules:
+            if hasattr(m, 'unknown_command'):
+                try:
+                    if m.unknown_command(args):
+                        return
+                except Exception as e:
+                    print("ERROR in command: %s" % str(e))
         print("Unknown command '%s'" % line)
         return
     (fn, help) = command_map[cmd]
@@ -1339,74 +488,9 @@ def process_stdin(line):
         fn(args[1:])
     except Exception as e:
         print("ERROR in command: %s" % str(e))
+        if mpstate.settings.moddebug > 1:
+            traceback.print_exc()
 
-
-def scale_rc(servo, min, max, param):
-    '''scale a PWM value'''
-    # default to servo range of 1000 to 2000
-    min_pwm  = get_mav_param('%s_MIN'  % param, 0)
-    max_pwm  = get_mav_param('%s_MAX'  % param, 0)
-    if min_pwm == 0 or max_pwm == 0:
-        return 0
-    if max_pwm == min_pwm:
-        p = 0.0
-    else:
-        p = (servo-min_pwm) / float(max_pwm-min_pwm)
-    v = min + p*(max-min)
-    if v < min:
-        v = min
-    if v > max:
-        v = max
-    return v
-
-
-def system_check():
-    '''check that the system is ready to fly'''
-    ok = True
-
-    if mavutil.mavlink.WIRE_PROTOCOL_VERSION == '1.0':
-        if not 'GPS_RAW_INT' in mpstate.status.msgs:
-            say("WARNING no GPS status")
-            return
-        if mpstate.status.msgs['GPS_RAW_INT'].fix_type != 3:
-            say("WARNING no GPS lock")
-            ok = False
-    else:
-        if not 'GPS_RAW' in mpstate.status.msgs and not 'GPS_RAW_INT' in mpstate.status.msgs:
-            say("WARNING no GPS status")
-            return
-        if mpstate.status.msgs['GPS_RAW'].fix_type != 2:
-            say("WARNING no GPS lock")
-            ok = False
-
-    if not 'PITCH_MIN' in mpstate.mav_param:
-        say("WARNING no pitch parameter available")
-        return
-
-    if int(mpstate.mav_param['PITCH_MIN']) > 1300:
-        say("WARNING PITCH MINIMUM not set")
-        ok = False
-
-    if not 'ATTITUDE' in mpstate.status.msgs:
-        say("WARNING no attitude recorded")
-        return
-
-    if math.fabs(mpstate.status.msgs['ATTITUDE'].pitch) > math.radians(5):
-        say("WARNING pitch is %u degrees" % math.degrees(mpstate.status.msgs['ATTITUDE'].pitch))
-        ok = False
-
-    if math.fabs(mpstate.status.msgs['ATTITUDE'].roll) > math.radians(5):
-        say("WARNING roll is %u degrees" % math.degrees(mpstate.status.msgs['ATTITUDE'].roll))
-        ok = False
-
-    if ok:
-        say("All OK SYSTEM READY TO FLY")
-
-
-def beep():
-    f = open("/dev/tty", mode="w")
-    f.write(chr(7))
-    f.close()
 
 def vcell_to_battery_percent(vcell):
     '''convert a cell voltage to a percentage battery level'''
@@ -1447,7 +531,7 @@ def battery_update(SYS_STATUS):
         mpstate.status.avionics_battery_level = (95*mpstate.status.avionics_battery_level + 5*avionics_battery_level)/100
 
 def battery_report():
-    batt_mon = mpstate.mav_param.get('BATT_MONITOR',0)
+    batt_mon = get_mav_param('BATT_MONITOR',0)
 
     #report voltage level only 
     if batt_mon == 3:
@@ -1572,8 +656,6 @@ def master_callback(m, master):
             mpstate.status.target_system = m.get_srcSystem()
             mpstate.status.target_component = m.get_srcComponent()
             say("online system %u component %u" % (mpstate.status.target_system, mpstate.status.target_component),'message')
-            if len(mpstate.mav_param_set) == 0 or len(mpstate.mav_param_set) != mpstate.mav_param_count:
-                master.param_fetch_all()
 
         if mpstate.status.heartbeat_error:
             mpstate.status.heartbeat_error = False
@@ -1592,96 +674,41 @@ def master_callback(m, master):
                 say("ARMED")
             else:
                 say("DISARMED")
+
+        if master.flightmode != mpstate.status.flightmode and time.time() > mpstate.status.last_mode_announce + 2:
+            mpstate.status.flightmode = master.flightmode
+            mpstate.status.last_mode_announce = time.time()
+            mpstate.rl.set_prompt(mpstate.status.flightmode + "> ")
+            say("Mode " + mpstate.status.flightmode)
+
+        if m.type in [mavutil.mavlink.MAV_TYPE_FIXED_WING]:
+            mpstate.vehicle_type = 'plane'
+            mpstate.vehicle_name = 'ArduPlane'
+        elif m.type in [mavutil.mavlink.MAV_TYPE_GROUND_ROVER,
+                        mavutil.mavlink.MAV_TYPE_SURFACE_BOAT,
+                        mavutil.mavlink.MAV_TYPE_SUBMARINE]:
+            mpstate.vehicle_type = 'rover'
+            mpstate.vehicle_name = 'APMrover2'
+        elif m.type in [mavutil.mavlink.MAV_TYPE_QUADROTOR,
+                        mavutil.mavlink.MAV_TYPE_COAXIAL,
+                        mavutil.mavlink.MAV_TYPE_HEXAROTOR,
+                        mavutil.mavlink.MAV_TYPE_OCTOROTOR,
+                        mavutil.mavlink.MAV_TYPE_TRICOPTER,
+                        mavutil.mavlink.MAV_TYPE_HELICOPTER]:
+            mpstate.vehicle_type = 'copter'
+            mpstate.vehicle_name = 'ArduCopter'
+        elif m.type in [mavutil.mavlink.MAV_TYPE_ANTENNA_TRACKER]:
+            mpstate.vehicle_type = 'antenna'
+            mpstate.vehicle_name = 'AntennaTracker'
         
     elif mtype == 'STATUSTEXT':
         if m.text != mpstate.status.last_apm_msg or time.time() > mpstate.status.last_apm_msg_time+2:
             mpstate.console.writeln("APM: %s" % m.text, bg='red')
             mpstate.status.last_apm_msg = m.text
             mpstate.status.last_apm_msg_time = time.time()
-    elif mtype == 'PARAM_VALUE':
-        param_id = "%.16s" % m.param_id
-        if m.param_index != -1 and m.param_index not in mpstate.mav_param_set:
-            added_new_parameter = True
-            mpstate.mav_param_set.add(m.param_index)
-        else:
-            added_new_parameter = False
-        if m.param_count != -1:
-            mpstate.mav_param_count = m.param_count
-        mpstate.mav_param[str(param_id)] = m.param_value
-        if mpstate.status.fetch_one > 0:
-            mpstate.status.fetch_one -= 1
-            mpstate.console.writeln("%s = %f" % (param_id, m.param_value))
-        if added_new_parameter and len(mpstate.mav_param_set) == m.param_count:
-            mpstate.console.writeln("Received %u parameters" % m.param_count)
-            if mpstate.status.logdir != None:
-                mpstate.mav_param.save(os.path.join(mpstate.status.logdir, 'mav.parm'), '*', verbose=True)
-
-    elif mtype == 'SERVO_OUTPUT_RAW':
-        if opts.quadcopter:
-            mpstate.status.rc_throttle[0] = scale_rc(m.servo1_raw, 0.0, 1.0, param='RC3')
-            mpstate.status.rc_throttle[1] = scale_rc(m.servo2_raw, 0.0, 1.0, param='RC3')
-            mpstate.status.rc_throttle[2] = scale_rc(m.servo3_raw, 0.0, 1.0, param='RC3')
-            mpstate.status.rc_throttle[3] = scale_rc(m.servo4_raw, 0.0, 1.0, param='RC3')
-        else:
-            mpstate.status.rc_aileron  = scale_rc(m.servo1_raw, -1.0, 1.0, param='RC1') * mpstate.settings.rc1mul
-            mpstate.status.rc_elevator = scale_rc(m.servo2_raw, -1.0, 1.0, param='RC2') * mpstate.settings.rc2mul
-            mpstate.status.rc_throttle = scale_rc(m.servo3_raw, 0.0, 1.0, param='RC3')
-            mpstate.status.rc_rudder   = scale_rc(m.servo4_raw, -1.0, 1.0, param='RC4') * mpstate.settings.rc4mul
-            if mpstate.status.rc_throttle < 0.1:
-                mpstate.status.rc_throttle = 0
-
-    elif mtype in ['WAYPOINT_COUNT','MISSION_COUNT']:
-        if mpstate.status.wp_op is None:
-            mpstate.console.error("No waypoint load started")
-        else:
-            mpstate.status.wploader.clear()
-            mpstate.status.wploader.expected_count = m.count
-            mpstate.console.writeln("Requesting %u waypoints t=%s now=%s" % (m.count,
-                                                                             time.asctime(time.localtime(m._timestamp)),
-                                                                             time.asctime()))
-            master.waypoint_request_send(0)
-
-    elif mtype in ['WAYPOINT', 'MISSION_ITEM'] and mpstate.status.wp_op != None:
-        if m.seq > mpstate.status.wploader.count():
-            mpstate.console.writeln("Unexpected waypoint number %u - expected %u" % (m.seq, mpstate.status.wploader.count()))
-        elif m.seq < mpstate.status.wploader.count():
-            # a duplicate
-            pass
-        else:
-            mpstate.status.wploader.add(m)
-        if m.seq+1 < mpstate.status.wploader.expected_count:
-            master.waypoint_request_send(m.seq+1)
-        else:
-            if mpstate.status.wp_op == 'list':
-                for i in range(mpstate.status.wploader.count()):
-                    w = mpstate.status.wploader.wp(i)
-                    print("%u %u %.10f %.10f %f p1=%.1f p2=%.1f p3=%.1f p4=%.1f cur=%u auto=%u" % (
-                        w.command, w.frame, w.x, w.y, w.z,
-                        w.param1, w.param2, w.param3, w.param4,
-                        w.current, w.autocontinue))
-                if mpstate.status.logdir != None:
-                    waytxt = os.path.join(mpstate.status.logdir, 'way.txt')
-                    save_waypoints(waytxt)
-                    print("Saved waypoints to %s" % waytxt)
-            elif mpstate.status.wp_op == "save":
-                save_waypoints(mpstate.status.wp_save_filename)
-            mpstate.status.wp_op = None
-
-    elif mtype in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
-        process_waypoint_request(m, master)
-
-    elif mtype in ["WAYPOINT_CURRENT", "MISSION_CURRENT"]:
-        if m.seq != mpstate.status.last_waypoint:
-            mpstate.status.last_waypoint = m.seq
-            say("waypoint %u" % m.seq,priority='message')
 
     elif mtype == "SYS_STATUS":
         battery_update(m)
-        if master.flightmode != mpstate.status.flightmode and time.time() > mpstate.status.last_mode_announce + 2:
-            mpstate.status.flightmode = master.flightmode
-            mpstate.status.last_mode_announce = time.time()
-            mpstate.rl.set_prompt(mpstate.status.flightmode + "> ")
-            say("Mode " + mpstate.status.flightmode)
 
     elif mtype == "VFR_HUD":
         have_gps_fix = False
@@ -1757,7 +784,7 @@ def master_callback(m, master):
                 r.write(m.get_msgbuf())
 
         # pass to modules
-        for mod in mpstate.modules:
+        for (mod,pm) in mpstate.modules:
             if not hasattr(mod, 'mavlink_packet'):
                 continue
             try:
@@ -1766,7 +793,6 @@ def master_callback(m, master):
                 if mpstate.settings.moddebug == 1:
                     print(msg)
                 elif mpstate.settings.moddebug > 1:
-                    import traceback
                     exc_type, exc_value, exc_traceback = sys.exc_info()
                     traceback.print_exception(exc_type, exc_value, exc_traceback,
                                               limit=2, file=sys.stdout)
@@ -1847,8 +873,9 @@ def log_writer():
             mpstate.logfile_raw.write(mpstate.logqueue_raw.get())
         while not mpstate.logqueue.empty():
             mpstate.logfile.write(mpstate.logqueue.get())
-        mpstate.logfile.flush()
-        mpstate.logfile_raw.flush()
+        if mpstate.settings.flushlogs:
+            mpstate.logfile.flush()
+            mpstate.logfile_raw.flush()
 
 def open_logs():
     '''open log files'''
@@ -1947,39 +974,11 @@ def periodic_tasks():
 
     set_stream_rates()
 
-    if param_period.trigger():
-        if len(mpstate.mav_param_set) == 0:
-            mpstate.master().param_fetch_all()
-        elif mpstate.mav_param_count != 0 and len(mpstate.mav_param_set) != mpstate.mav_param_count:
-            if mpstate.master().time_since('PARAM_VALUE') >= 1:
-                diff = set(range(mpstate.mav_param_count)).difference(mpstate.mav_param_set)
-                count = 0
-                while len(diff) > 0 and count < mpstate.settings.parambatch:
-                    idx = diff.pop()
-                    mpstate.master().param_fetch_one(idx)
-                    count += 1
-
-        # cope with packet loss fetching mission
-        if mpstate.master().time_since('MISSION_ITEM') >= 2 and mpstate.status.wploader.count() < getattr(mpstate.status.wploader,'expected_count',0):
-            seq = mpstate.status.wploader.count()
-            print("re-requesting WP %u" % seq)
-            mpstate.master().waypoint_request_send(seq)
-
     if battery_period.trigger():
         battery_report()
 
-    if mpstate.override_period.trigger():
-        if (mpstate.status.override != [ 0 ] * 8 or
-            mpstate.status.override != mpstate.status.last_override or
-            mpstate.status.override_counter > 0):
-            mpstate.status.last_override = mpstate.status.override[:]
-            send_rc_override()
-            if mpstate.status.override_counter > 0:
-                mpstate.status.override_counter -= 1
-
-
     # call optional module idle tasks. These are called at several hundred Hz
-    for m in mpstate.modules:
+    for (m,pm) in mpstate.modules:
         if hasattr(m, 'idle_task'):
             try:
                 m.idle_task()
@@ -1987,7 +986,6 @@ def periodic_tasks():
                 if mpstate.settings.moddebug == 1:
                     print(msg)
                 elif mpstate.settings.moddebug > 1:
-                    import traceback
                     exc_type, exc_value, exc_traceback = sys.exc_info()
                     traceback.print_exception(exc_type, exc_value, exc_traceback,
                                               limit=2, file=sys.stdout)
@@ -1999,32 +997,9 @@ def main_loop():
         for master in mpstate.mav_master:
             send_heartbeat(master)
             master.wait_heartbeat()
-            if len(mpstate.mav_param) < 10 or not mpstate.continue_mode:
-                mpstate.mav_param_set = set()
-                master.param_fetch_all()
         set_stream_rates()
 
-    # Change these depending on your Quadcopter / APM
-    sweetSpot=0.2 
-    upSpeed=100
-    downSpeed=300
-    global goalAltitude
-    global midValue
-    global chanThrottle
     while True:
-        if (goalAltitude >= 0):
-            altDiff = goalAltitude - float(mpstate.status.altitude)
-            # print(altDiff)
-            if (abs(altDiff) > sweetSpot): # If height is not within sweetSpot correct range
-                # print("Goal altitude: ", goalAltitude, " current altitude: ", mpstate.status.altitude)
-                if (altDiff > 0):
-                    cmd_rc([chanThrottle, midValue+upSpeed])
-                else:
-                    cmd_rc([chanThrottle, midValue-downSpeed])
-            else:
-                print("Altitude correction complete! Current altitude: ", mpstate.status.altitude)
-                goalAltitude=-1
-                cmd_rc([chanThrottle, midValue])
         if mpstate is None or mpstate.status.exit:
             return
         if mpstate.rl.line is not None:
@@ -2087,11 +1062,12 @@ def main_loop():
 
 def input_loop():
     '''wait for user input'''
-    while True:
+    while mpstate.status.exit != True:
         while mpstate.rl.line is not None:
             time.sleep(0.01)
         try:
-            line = raw_input(mpstate.rl.prompt)
+            if mpstate.status.exit != True:
+                line = raw_input(mpstate.rl.prompt)
         except EOFError:
             mpstate.status.exit = True
             sys.exit(1)
@@ -2120,11 +1096,14 @@ if __name__ == '__main__':
     from optparse import OptionParser
     parser = OptionParser("mavproxy.py [options]")
 
-    parser.add_option("--master",dest="master", action='append', help="MAVLink master port", default=[])
+    parser.add_option("--master", dest="master", action='append',
+                      metavar="DEVICE[,BAUD]", help="MAVLink master port and optional baud rate",
+                      default=[])
+    parser.add_option("--out", dest="output", action='append',
+                      metavar="DEVICE[,BAUD]", help="MAVLink output port and optional baud rate",
+                      default=[])
     parser.add_option("--baudrate", dest="baudrate", type='int',
-                      help="master port baud rate", default=115200)
-    parser.add_option("--out",   dest="output", help="MAVLink output port",
-                      action='append', default=[])
+                      help="default serial baud rate", default=115200)
     parser.add_option("--sitl", dest="sitl",  default=None, help="SITL output port")
     parser.add_option("--streamrate",dest="streamrate", default=4, type='int',
                       help="MAVLink stream rate")
@@ -2170,7 +1149,7 @@ if __name__ == '__main__':
 
     if opts.mav09:
         os.environ['MAVLINK09'] = '1'
-    from pymavlink import mavutil, mavwp, mavparm
+    from pymavlink import mavutil, mavparm
     mavutil.set_dialect(opts.dialect)
 
     # global mavproxy state
@@ -2182,7 +1161,7 @@ if __name__ == '__main__':
     if opts.speech:
         # start the speech-dispatcher early, so it doesn't inherit any ports from
         # modules/mavutil
-        say('Startup')
+        load_module('speech')
 
     if not opts.master:
         serial_list = mavutil.auto_detect_serial(preferred_list=['*FTDI*',"*Arduino_Mega_2560*", "*3D_Robotics*", "*USB_to_UART*"])
@@ -2210,7 +1189,12 @@ Auto-detected serial ports are:
 
     # open master link
     for mdev in opts.master:
-        m = mavutil.mavlink_connection(mdev, autoreconnect=True, baud=opts.baudrate)
+        if ',' in mdev and not os.path.exists(mdev):
+            port, baud = mdev.split(',')
+        else:
+            port, baud = mdev, opts.baudrate
+
+        m = mavutil.mavlink_connection(port, autoreconnect=True, baud=int(baud))
         m.mav.set_callback(master_callback, m)
         if hasattr(m.mav, 'set_send_callback'):
             m.mav.set_send_callback(master_send_callback, m)
@@ -2228,41 +1212,28 @@ Auto-detected serial ports are:
     # log all packets from the master, for later replay
     open_logs()
 
-    if mpstate.continue_mode and mpstate.status.logdir != None:
-        parmfile = os.path.join(mpstate.status.logdir, 'mav.parm')
-        if os.path.exists(parmfile):
-            mpstate.mav_param.load(parmfile)
-            for m in mpstate.mav_master:
-                m.param_fetch_complete = True
-        waytxt = os.path.join(mpstate.status.logdir, 'way.txt')
-        if os.path.exists(waytxt):
-            mpstate.status.wploader.load(waytxt)
-            print("Loaded waypoints from %s" % waytxt)
-
     # open any mavlink UDP ports
     for p in opts.output:
-        mpstate.mav_outputs.append(mavutil.mavlink_connection(p, baud=opts.baudrate, input=False))
+        if ',' in p and not os.path.exists(p):
+            port, baud = p.split(',')            
+        else:
+            port, baud = p, opts.baudrate
+
+        mpstate.mav_outputs.append(mavutil.mavlink_connection(port, baud=int(baud), input=False))
 
     if opts.sitl:
         mpstate.sitl_output = mavutil.mavudp(opts.sitl, input=False)
 
     mpstate.settings.numcells = opts.num_cells
-    mpstate.settings.speech = opts.speech
     mpstate.settings.streamrate = opts.streamrate
     mpstate.settings.streamrate2 = opts.streamrate
 
     msg_period = mavutil.periodic_event(1.0/15)
-    param_period = mavutil.periodic_event(1)
-    log_period = mavutil.periodic_event(2)
     heartbeat_period = mavutil.periodic_event(1)
     battery_period = mavutil.periodic_event(0.1)
-    if mpstate.sitl_output:
-        mpstate.override_period = mavutil.periodic_event(20)
-    else:
-        mpstate.override_period = mavutil.periodic_event(1)
     heartbeat_check_period = mavutil.periodic_event(0.33)
 
-    mpstate.rl = rline.rline("MAV> ")
+    mpstate.rl = rline.rline("MAV> ", mpstate)
     if opts.setup:
         mpstate.rl.set_prompt("")
 
@@ -2280,9 +1251,10 @@ Auto-detected serial ports are:
 
     if not opts.setup:
         # some core functionality is in modules
-        standard_modules = ['log','rally','fence']
+        standard_modules = ['log','rally','fence','param','relay',
+                            'tuneopt','arm','mode','calibration','rc','wp','auxopt']
         for m in standard_modules:
-            process_stdin('module load %s' % m)
+            load_module(m, quiet=True)
 
     if opts.console:
         process_stdin('module load console')
@@ -2307,9 +1279,32 @@ Auto-detected serial ports are:
 
     # use main program for input. This ensures the terminal cleans
     # up on exit
-    try:
-        input_loop()
-    except KeyboardInterrupt:
-        print("exiting")
-        mpstate.status.exit = True
-        sys.exit(1)
+    while (mpstate.status.exit != True):
+        try:
+            input_loop()
+        except KeyboardInterrupt:
+            if mpstate.settings.requireexit:
+                print("Interrupt caught.  Use 'exit' to quit MAVProxy.")
+
+                #Just lost the map and console, get them back:
+                for (m,pm) in mpstate.modules:
+                    if m.name in ["map", "console"]:
+                        if hasattr(m, 'unload'):
+                            try:
+                                m.unload()
+                            except Exception:
+                                pass
+                        reload(m)
+                        m.init(mpstate)   
+
+            else:
+                mpstate.status.exit = True
+                sys.exit(1)
+
+    #this loop executes after leaving the above loop and is for cleanup on exit
+    for (m,pm) in mpstate.modules:
+        if hasattr(m, 'unload'):
+            print "Unloading module:", m.name
+            m.unload()
+        
+    sys.exit(1)

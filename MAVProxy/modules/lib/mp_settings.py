@@ -8,6 +8,12 @@ class MPSettings(object):
             (v,t,d) = var
             self.set(v, d)
 
+    def append(self, var):
+        '''add a new setting'''
+        (v,t,d) = var
+        self.vars.append(var)
+        self.set(v, d)
+
     def set(self, vname, value):
         '''set a setting'''
         if value is None or value == 'None':
@@ -39,3 +45,20 @@ class MPSettings(object):
         for (v,t,d) in self.vars:
             ret.append(v)
         return ret
+
+    def completion(self, text):
+        '''completion function for cmdline completion'''
+        return self.list()
+
+    def command(self, args):
+        '''control options from cmdline'''
+        if len(args) == 0:
+            self.show_all()
+            return
+        if getattr(self, args[0], [None]) == [None]:
+            print("Unknown setting '%s'" % args[0])
+            return
+        if len(args) == 1:
+            self.show(args[0])
+        else:
+            self.set(args[0], args[1])

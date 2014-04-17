@@ -50,6 +50,8 @@ TILE_SERVICES = {
 	"MicrosoftSat"   : "http://ecn.t${MS_DIGIT}.tiles.virtualearth.net/tiles/a${QUAD}.png?g=441&mkt=en-us&n=z",
 	"MicrosoftMap"   : "http://ecn.t${MS_DIGIT}.tiles.virtualearth.net/tiles/r${QUAD}.png?g=441&mkt=en-us&n=z",
 	"MicrosoftTer"   : "http://ecn.t${MS_DIGIT}.tiles.virtualearth.net/tiles/r${QUAD}.png?g=441&mkt=en-us&shading=hill&n=z",
+        "OviSat"         : "http://maptile.maps.svc.ovi.com/maptiler/v2/maptile/newest/satellite.day/${Z}/${X}/${Y}/256/png8",
+        "OviHybrid"      : "http://maptile.maps.svc.ovi.com/maptiler/v2/maptile/newest/hybrid.day/${Z}/${X}/${Y}/256/png8",
 	"OpenStreetMap"  : "http://tile.openstreetmap.org/${ZOOM}/${X}/${Y}.png",
 	"OSMARender"     : "http://tah.openstreetmap.org/Tiles/tile/${ZOOM}/${X}/${Y}.png",
 	"OpenAerialMap"  : "http://tile.openaerialmap.org/tiles/?v=mgm&layer=openaerialmap-900913&x=${X}&y=${Y}&zoom=${OAM_ZOOM}",
@@ -196,7 +198,13 @@ class MPTile:
 		self._download_thread = None
                 self._loading = mp_icon('loading.jpg')
 		self._unavailable = mp_icon('unavailable.jpg')
-		self._tile_cache = collections.OrderedDict()
+		try:
+			self._tile_cache = collections.OrderedDict()
+		except AttributeError:
+			# OrderedDicts in python 2.6 come from the ordereddict module
+			# which is a 3rd party package, not in python2.6 distribution
+			import ordereddict
+			self._tile_cache = ordereddict.OrderedDict()
 
         def set_service(self, service):
                 '''set tile service'''
@@ -345,6 +353,10 @@ class MPTile:
 					continue
 
 			# copy out the quadrant we want
+                        availx = min(TILES_WIDTH - tile_info.offsetx, width2)
+                        availy = min(TILES_HEIGHT - tile_info.offsety, height2)
+                        if availx != width2 or availy != height2:
+                                continue
 			cv.SetImageROI(img, (tile_info.offsetx, tile_info.offsety, width2, height2))
 			img2 = cv.CreateImage((width2,height2), 8, 3)
                         try:
