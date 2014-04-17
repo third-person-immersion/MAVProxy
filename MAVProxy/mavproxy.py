@@ -402,22 +402,6 @@ command_map = {
     'setup'   : (cmd_setup,    'go into setup mode'),
     'reset'   : (cmd_reset,    'reopen the connection to the MAVLink master'),
     'status'  : (cmd_status,   'show status'),
-<<<<<<< HEAD
-    'auto'    : (cmd_auto,     'set AUTO mode'),
-    'mode'    : (cmd_mode,     'set a mode'),
-    'ground'  : (cmd_ground,   'do a ground start'),
-    'level'   : (cmd_level,    'set level on a multicopter'),
-    'accelcal': (cmd_accelcal, 'do 3D accelerometer calibration'),
-    'compassmot': (cmd_compassmot, 'do compass/motor interference calibration'),
-    'calpress': (cmd_calpressure,'calibrate pressure sensors'),
-    'loiter'  : (cmd_loiter,   'set LOITER mode'),
-    'althold' : (cmd_althold,  'set ALTHOLD mode'),
-    'rtl'     : (cmd_rtl,      'set RTL mode'),
-    'manual'  : (cmd_manual,   'set MANUAL mode'),
-    'fbwa'    : (cmd_fbwa,     'set FBWA mode'),
-    'guided'  : (cmd_guided,   'set GUIDED target'),
-=======
->>>>>>> upstream/master
     'set'     : (cmd_set,      'mavproxy settings'),
     'bat'     : (cmd_bat,      'show battery levels'),
     'alt'     : (cmd_alt,      'show relative altitude'),
