@@ -1236,7 +1236,7 @@ Auto-detected serial ports are:
     if not opts.setup:
         # some core functionality is in modules
         standard_modules = ['log','rally','fence','param','relay',
-                            'tuneopt','arm','mode','calibration','rc','wp','auxopt']
+                            'tuneopt','arm','mode','calibration','rc','wp','auxopt','quadcontrols']
         for m in standard_modules:
             load_module(m, quiet=True)
 
