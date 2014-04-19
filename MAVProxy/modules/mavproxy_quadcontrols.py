@@ -11,6 +11,8 @@ class QuadcontrolsModule(mp_module.MPModule):
         self.add_command('movez', self.cmd_movez, "Move forwards or backwards", ['-100 - 100'])
         self.add_command('strafe', self.cmd_strafe, "Strafe left or right", ['-100 - 100'])
         self.add_command('yaw', self.cmd_yaw, "Yaw left or right", ['-100 - 100'])
+        self.add_command('hover', self.cmd_hover, "Resets the vehicle to stand still in alt_hold mode")
+        self.add_command('bend', self.cmd_bend, "Moves the vehicle in a curve movement", ['-100 - 100'])
 
 
     # Global variables used to control the vehicle, change these depending on your controller or APM
@@ -61,28 +63,29 @@ class QuadcontrolsModule(mp_module.MPModule):
         self.cmd_movecopter([self.chanYaw, val])
 
 
-#def cmd_bend(args):
-#    if len(args) != 2:
-#        print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
-#        return
-#    yawP = int(args[0])
-#    pitchP = int(args[1])
-#    if (yawP > 100 or yawP < -100 or pitchP > 100 or pitchP < -100):
-#        print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
-#        return
-#    cmd_movecopter([chanYaw, yawP])
-#    cmd_movecopter([chanPitch, pitchP])
+    def cmd_bend(self, args):
+        if len(args) != 2:
+            print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
+            return
+        yawP = int(args[0])
+        pitchP = int(args[1])
+        if (yawP > 100 or yawP < -100 or pitchP > 100 or pitchP < -100):
+            print ("Usage: bend <procent yaw> <procent pitch> (between -100 and 100)")
+            return
+        self.cmd_movecopter([self.chanYaw, yawP])
+        self.cmd_movecopter([self.chanPitch, pitchP])
 
-#def cmd_hover(args):
-#    print ("Resetting vehicle to stand still loiter mode")
-#    cmd_movecopter([chanRoll, 0])
-#    cmd_movecopter([chanPitch, 0])
-#    cmd_movecopter([chanThrottle, 0])
-#    cmd_movecopter([chanYaw, 0])
-#    cmd_althold
+    def cmd_hover(self, args):
+        print("Resetting vehicle to stand still in alt_hold mode")
+        self.cmd_movecopter([self.chanRoll, 0])
+        self.cmd_movecopter([self.chanPitch, 0])
+        self.cmd_movecopter([self.chanThrottle, 0])
+        self.cmd_movecopter([self.chanYaw, 0])
+        self.mpstate.functions.process_stdin("mode alt_hold")
+        print("Done")
 
     
-# Help function to movez, strafe and yaw
+    # Help function to movez, strafe and yaw
     def cmd_movecopter(self, args):
         if len(args) != 2:
             print("Error using cmd_movecopter, wrong number of arguments")
@@ -90,18 +93,14 @@ class QuadcontrolsModule(mp_module.MPModule):
         channel = int(args[0])
         valProcent = int(args[1])
         throttle=self.midValue
-   # if abs(valProcent) <= procentZone:
-   #     rawValue = midValue
-   # elif valProcent > 0:
         if valProcent > 0:
             rawValue=self.midValue+(self.calcValue(abs(valProcent)))
         else:
             rawValue=self.midValue-(self.calcValue(abs(valProcent)))
         if self.debugMode:
             print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
-        rc=super(QuadcontrolsModule, self).module('rc')
-        rc.cmd_rc([self.chanThrottle, throttle])
-        rc.cmd_rc([channel, rawValue])
+        self.mpstate.functions.process_stdin("rc %d %d" % (self.chanThrottle, throttle))
+        self.mpstate.functions.process_stdin("rc %d %d" % (channel, rawValue)) 
         print("Done")
 
 
