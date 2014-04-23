@@ -22,6 +22,7 @@ from MAVProxy.modules.lib import mp_settings
 from MAVProxy.modules.lib import rline
 from MAVProxy.modules.lib import mp_module
 from MAVProxy.modules.lib import dumpstacks
+from pymavlink import mavutil, mavwp, mavparm
 
 class MPStatus(object):
     '''hold status information about the mavproxy'''
