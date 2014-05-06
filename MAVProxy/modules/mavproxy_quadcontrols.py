@@ -114,7 +114,7 @@ class QuadcontrolsModule(mp_module.MPModule):
         else:
             rawValue=self.midValue-(self.calcValue(abs(valProcent)))
         if self.debugMode:
-            print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
+            print("Throttling with value ", rawValue, " on channel ", channel)
         #self.mpstate.functions.process_stdin("rc %d %d" % (self.chanThrottle, throttle))
         self.mpstate.functions.process_stdin("rc %d %d" % (channel, rawValue)) 
         print("Done")
