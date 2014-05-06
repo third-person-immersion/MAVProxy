@@ -10,9 +10,11 @@ class QuadcontrolsModule(mp_module.MPModule):
         super(QuadcontrolsModule, self).__init__(mpstate, "quadcontrols", "additional controls for quadcopter handling", public = True)
         self.add_command('movez', self.cmd_movez, "Move forwards or backwards", ['-100 - 100'])
         self.add_command('strafe', self.cmd_strafe, "Strafe left or right", ['-100 - 100'])
+        self.add_command('movey', self.cmd_movey, "Move up or down", ['-100 - 100'])        
         self.add_command('yaw', self.cmd_yaw, "Yaw left or right", ['-100 - 100'])
         self.add_command('hover', self.cmd_hover, "Resets the vehicle to stand still in alt_hold mode")
         self.add_command('bend', self.cmd_bend, "Moves the vehicle in a curve movement", ['-100 - 100'])
+        self.add_command('initquadcontrol', self.cmd_initqc, "Initializes quadcontrol")
 
 
     # Global variables used to control the vehicle, change these depending on your controller or APM
@@ -26,6 +28,10 @@ class QuadcontrolsModule(mp_module.MPModule):
     maxValue=2200 # Max value.
     debugMode=True
 
+    def cmd_initqc(self, test):
+        self.cmd_movecopter([self.chanThrottle, self.midValue])
+        mavproxy.mpstate.functions.process_stdin("mode alt_hold")
+        print("Quadcontrol initialization done")
 
     def calcValue(self, procent):
         valproc=float(procent)/100
@@ -41,6 +47,16 @@ class QuadcontrolsModule(mp_module.MPModule):
             print ("Usage: movez <procent value (between -100 and 100)>")
             return
         self.cmd_movecopter([self.chanPitch, val])
+    
+    def cmd_movey(self, args):
+        if len(args) != 1:
+            print ("Usage: movey <procent value (between -100 and 100)>")
+            return
+        val = int(args[0])
+        if (val > 100 or val < -100):
+            print ("Usage: movey <procent value (between -100 and 100)>")
+            return
+        self.cmd_movecopter([self.chanThrottle, val])
 
     def cmd_strafe(self, args):
         if len(args) != 1:
@@ -92,14 +108,14 @@ class QuadcontrolsModule(mp_module.MPModule):
             return
         channel = int(args[0])
         valProcent = int(args[1])
-        throttle=self.midValue
+        #throttle=self.midValue
         if valProcent > 0:
             rawValue=self.midValue+(self.calcValue(abs(valProcent)))
         else:
             rawValue=self.midValue-(self.calcValue(abs(valProcent)))
         if self.debugMode:
             print("Throttling at ", throttle, " with value ", rawValue, " on channel ", channel)
-        self.mpstate.functions.process_stdin("rc %d %d" % (self.chanThrottle, throttle))
+        #self.mpstate.functions.process_stdin("rc %d %d" % (self.chanThrottle, throttle))
         self.mpstate.functions.process_stdin("rc %d %d" % (channel, rawValue)) 
         print("Done")
 
